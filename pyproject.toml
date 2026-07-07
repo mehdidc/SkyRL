@@ -23,6 +23,7 @@ dependencies = [
     "peft==0.18.1",
     "hf_transfer",
     "cloudpathlib>=0.23.0",
+    "ttt-discover",
 ]
 
 [project.optional-dependencies]
@@ -243,6 +244,9 @@ override-dependencies = [
     "transformer-engine[pytorch]==2.11.0; sys_platform == 'linux'",
     "transformers>=5.6.1,<=5.8.0; sys_platform == 'linux'",
     "megatron-core>=0.16.0; sys_platform == 'linux' and python_version >= '3.12'",
+    # onnx 1.22.0's cp312 abi3 wheel installs without package init files in
+    # this uv environment, leaving `onnx` as an empty namespace package.
+    "onnx<1.22; sys_platform == 'linux'",
     "ml_dtypes>=0.5.0; sys_platform == 'linux'",
     "transformer-engine-cu13; sys_platform == 'never'",
     # `nixl` hard-depends on both nixl-cu12 and nixl-cu13; drop the cu13 variant
@@ -326,8 +330,17 @@ megatron-core = {git = "https://github.com/NVIDIA/Megatron-LM", rev = "71e418ea7
 # NOTE (sumanthrh): This custom wheel of vllm-router includes a fix for /chat/completions endpoint: https://github.com/vllm-project/router/pull/162  on top of 0.1.14
 # TODO (sumanthrh): Remove this after 0.1.15 vllm-router release
 vllm-router = [
-    { url = "https://github.com/SumanthRH/router/releases/download/0.1.14.post1/vllm_router-0.1.14.post1-cp38-abi3-manylinux_2_35_x86_64.whl", marker = "sys_platform == 'linux' and platform_machine == 'x86_64'" },
+    # The forked linux_x86_64 wheel is built against glibc >= 2.38; JURECA's
+    # EL9 nodes provide glibc 2.34. Use the manylinux wheel so the Rust router
+    # extension imports instead of falling back to MiniLB.
+    { url = "https://files.pythonhosted.org/packages/ce/b5/f068ce341206ee2f3fcb7fd316ee7e14448f275ad628d55652a24c8f306e/vllm_router-0.1.14-cp38-abi3-manylinux_2_28_x86_64.whl", marker = "sys_platform == 'linux' and platform_machine == 'x86_64'" },
     { url = "https://github.com/SumanthRH/router/releases/download/0.1.14.post1/vllm_router-0.1.14.post1-cp38-abi3-manylinux_2_28_aarch64.whl", marker = "sys_platform == 'linux' and platform_machine == 'aarch64'" }
+]
+ttt-discover = { workspace = true, editable = true }
+
+[tool.uv.workspace]
+members = [
+    "discover",
 ]
 
 
@@ -388,4 +401,3 @@ ignore = [
 
 [tool.ruff.lint.isort]
 known-first-party = ["skyrl", "skyrl_gym"]
-
