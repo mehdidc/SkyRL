@@ -673,6 +673,9 @@ class GeneratorConfig(BaseConfig):
     merge_stepwise_output: bool = False
     """When True (and step_wise_trajectories is True), apply prefix-aware merging
     to collapse multi-turn step-wise sequences into single sequences before training."""
+    discover_state_evolution: bool = False
+    """When True, supported Discover-style environments may feed the best candidate found so far
+    back into later prompts within the same training run."""
 
     def __post_init__(self):
 

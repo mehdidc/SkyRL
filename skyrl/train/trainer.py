@@ -1,3 +1,4 @@
+import json
 import math
 import os
 import shutil
@@ -133,6 +134,11 @@ class RayPPOTrainer:
         self.all_metrics = {}
         self.all_timings = {}
         self.global_step = 0
+        self.best_raw_reward_so_far: Optional[float] = None
+        self.best_final_reward_so_far: Optional[float] = None
+        self.best_env_raw_scores_so_far: Dict[str, float] = {}
+        self.discover_state: Dict[str, Dict[str, Any]] = {}
+        self.discover_state_directions: Dict[str, bool] = {}
 
         self._vllm_metrics_scraper: Optional[VLLMMetricsScraper] = (
             VLLMMetricsScraper() if cfg.generator.inference_engine.enable_ray_prometheus_stats else None
@@ -165,6 +171,184 @@ class RayPPOTrainer:
     def add_callback(self, callback: TrainingCallback) -> None:
         """Register a callback. Events fired after this call reach the new callback."""
         self._callback_handler.add(callback)
+
+    def _discover_state_enabled(self) -> bool:
+        return bool(getattr(self.cfg.generator, "discover_state_evolution", False))
+
+    def _apply_discover_state_evolution_to_prompts(self, prompts: List[Dict[str, Any]]) -> None:
+        """Inject the best known Discover state into supported environment prompts."""
+        if not self._discover_state_enabled():
+            return
+
+        for prompt in prompts:
+            env_class = prompt.get("env_class") or self.cfg.environment.env_class
+            state = self.discover_state.get(env_class)
+            if state is None:
+                continue
+
+            evolved_prompt = self._build_discover_evolved_prompt(env_class, prompt, state)
+            if evolved_prompt is not None:
+                prompt["prompt"] = evolved_prompt
+
+    def _build_discover_evolved_prompt(
+        self, env_class: str, prompt: Dict[str, Any], state: Dict[str, Any]
+    ) -> Optional[List[Dict[str, str]]]:
+        env_extras = prompt.setdefault("env_extras", {})
+        try:
+            if env_class == "ac1":
+                from examples.train.ac_inequalities.prepare_dataset import SYSTEM_PROMPT, build_ac1_prompt
+
+                env_extras["height_sequence_1"] = state["candidate_payload"]["sequence"]
+                budget_s = int(env_extras.get("timeout_s", state.get("budget_s", 1000)))
+                content = build_ac1_prompt(
+                    state["candidate_payload"]["sequence"],
+                    budget_s=budget_s,
+                    last_code=state.get("code"),
+                )
+            elif env_class == "circle_packing":
+                from examples.train.circle_packing.prepare_dataset import (
+                    SYSTEM_PROMPT,
+                    build_circle_packing_prompt,
+                )
+
+                num_circles = int(env_extras.get("num_circles", state["candidate_payload"].get("num_circles", 26)))
+                content = build_circle_packing_prompt(num_circles, previous=state)
+            elif env_class == "spherical_code":
+                from examples.train.spherical_code.prepare_dataset import SYSTEM_PROMPT, build_spherical_code_prompt
+
+                num_points = int(env_extras.get("num_points", state["candidate_payload"].get("num_points", 12)))
+                dim = int(env_extras.get("dim", state["candidate_payload"].get("dim", 3)))
+                content = build_spherical_code_prompt(num_points, dim, previous=state)
+            else:
+                return None
+        except Exception as exc:
+            logger.warning(f"Could not build evolved prompt for {env_class}: {exc}")
+            return None
+
+        return [
+            SYSTEM_PROMPT,
+            {
+                "role": "user",
+                "content": content,
+            },
+        ]
+
+    def _get_best_discover_updates_from_generator_output(
+        self, generator_input: GeneratorInput, generator_output: GeneratorOutput
+    ) -> Dict[str, Dict[str, Any]]:
+        env_metrics = generator_output.get("env_metrics") or []
+        env_classes = generator_input.get("env_classes") or []
+        if not env_metrics or not env_classes:
+            return {}
+
+        best_updates: Dict[str, Dict[str, Any]] = {}
+        for env_class, metrics in zip(env_classes, env_metrics):
+            if not metrics or not metrics.get("valid"):
+                continue
+            raw_score = metrics.get("raw_score")
+            if raw_score is None or "candidate_code" not in metrics:
+                continue
+            try:
+                raw_score = float(raw_score)
+            except (TypeError, ValueError):
+                continue
+            if not math.isfinite(raw_score):
+                continue
+            higher_is_better = bool(metrics.get("raw_score_higher_is_better", True))
+            candidate_payload = dict(metrics.get("candidate_payload") or {})
+            if env_class == "ac1":
+                sequence = metrics.get("candidate_sequence")
+                if sequence is None:
+                    continue
+                try:
+                    candidate_payload["sequence"] = [float(x) for x in sequence]
+                except (TypeError, ValueError):
+                    continue
+
+            current = best_updates.get(env_class)
+            is_better = (
+                current is None
+                or (higher_is_better and raw_score > current["raw_score"])
+                or (not higher_is_better and raw_score < current["raw_score"])
+            )
+            if is_better:
+                best_updates[env_class] = {
+                    "raw_score": raw_score,
+                    "code": metrics.get("candidate_code"),
+                    "candidate_payload": candidate_payload,
+                    "higher_is_better": higher_is_better,
+                    "global_step": self.global_step,
+                }
+                if "sequence_len" in metrics:
+                    best_updates[env_class]["sequence_len"] = metrics["sequence_len"]
+        return best_updates
+
+    def _update_best_env_raw_score_metrics(
+        self, generator_input: GeneratorInput, generator_output: GeneratorOutput
+    ) -> None:
+        env_metrics = generator_output.get("env_metrics") or []
+        env_classes = generator_input.get("env_classes") or []
+        for env_class, metrics in zip(env_classes, env_metrics):
+            if not metrics or not metrics.get("valid") or "raw_score" not in metrics:
+                continue
+            try:
+                raw_score = float(metrics["raw_score"])
+            except (TypeError, ValueError):
+                continue
+            if not math.isfinite(raw_score):
+                continue
+            higher_is_better = bool(metrics.get("raw_score_higher_is_better", True))
+            self._update_best_env_raw_score_metric(env_class, raw_score, higher_is_better=higher_is_better)
+
+    def _update_best_env_raw_score_metric(
+        self, env_class: str, raw_score: float, *, higher_is_better: bool
+    ) -> None:
+        current = self.best_env_raw_scores_so_far.get(env_class)
+        is_better = (
+            current is None
+            or (higher_is_better and raw_score > current)
+            or (not higher_is_better and raw_score < current)
+        )
+        if is_better:
+            self.best_env_raw_scores_so_far[env_class] = raw_score
+        best_score = self.best_env_raw_scores_so_far[env_class]
+        metric_name = f"environment/{env_class}_best_raw_score_so_far"
+        self.all_metrics[metric_name] = best_score
+        logger.info(f"{metric_name}: {best_score}")
+
+    def _update_discover_state_from_best_updates(self, best_updates: Dict[str, Dict[str, Any]]) -> None:
+        """Update Discover-style state from the best candidates in a generation batch."""
+        if not self._discover_state_enabled() or not best_updates:
+            return
+
+        for env_class, best_update in best_updates.items():
+            previous = self.discover_state.get(env_class)
+            higher_is_better = bool(best_update.get("higher_is_better", True))
+            if previous is not None:
+                prev_score = previous["raw_score"]
+                score = best_update["raw_score"]
+                if (higher_is_better and score <= prev_score) or (not higher_is_better and score >= prev_score):
+                    continue
+
+            self.discover_state[env_class] = best_update
+            self.discover_state_directions[env_class] = higher_is_better
+            self.all_metrics[f"discover/{env_class}_best_raw_score"] = best_update["raw_score"]
+            if "sequence_len" in best_update:
+                self.all_metrics[f"discover/{env_class}_best_sequence_len"] = best_update["sequence_len"]
+            logger.info(f"Updated {env_class} Discover state: raw_score={best_update['raw_score']}")
+            self._save_discover_state(env_class, best_update)
+
+    def _save_discover_state(self, env_class: str, state: Dict[str, Any]) -> None:
+        export_path = getattr(self.cfg.trainer, "export_path", None)
+        if not export_path:
+            return
+        path = Path(export_path) / "discover_state" / f"{env_class}_best.json"
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with path.open("w", encoding="utf-8") as f:
+                json.dump(state, f)
+        except Exception as exc:
+            logger.warning(f"Failed to save Discover state to {path}: {exc}")
 
     def _build_callback_input(self, **fields) -> CallbackInput:
         """Snapshot loop counters + per-event fields into a CallbackInput."""
@@ -299,6 +483,7 @@ class RayPPOTrainer:
 
                     # 0. truncate data to have even shards
                     rand_prompts = self._remove_tail_data(rand_prompts)
+                    self._apply_discover_state_evolution_to_prompts(rand_prompts)
                     generator_input, uids = prepare_generator_input(
                         rand_prompts,
                         self.cfg.generator.n_samples_per_prompt,
@@ -313,6 +498,11 @@ class RayPPOTrainer:
                     # 1.1. generation phase
                     with Timer("generate", self.all_timings):
                         generator_output: GeneratorOutput = await self.generate(generator_input)
+                    best_discover_updates = self._get_best_discover_updates_from_generator_output(
+                        generator_input, generator_output
+                    )
+                    self._update_best_env_raw_score_metrics(generator_input, generator_output)
+                    self._update_discover_state_from_best_updates(best_discover_updates)
 
                     if self.cfg.generator.step_wise_trajectories:
                         # NOTE: We use instance_ids from `trajectory_ids` here instead of re-using `uids`
@@ -1007,15 +1197,22 @@ class RayPPOTrainer:
                 per_token_rewards.append(per_token_reward)
 
         n_samples_per_prompt = self.cfg.generator.n_samples_per_prompt
+        avg_raw_reward = float(overall_metrics["avg_score"])
+        if self.best_raw_reward_so_far is None or avg_raw_reward > self.best_raw_reward_so_far:
+            self.best_raw_reward_so_far = avg_raw_reward
 
         reward_metrics = {
             f"reward/avg_pass_at_{n_samples_per_prompt}": overall_metrics["pass_at_n"],
-            "reward/avg_raw_reward": overall_metrics["avg_score"],
+            "reward/avg_raw_reward": avg_raw_reward,
+            "reward/best_avg_raw_reward_so_far": self.best_raw_reward_so_far,
             "reward/mean_positive_reward": overall_metrics["mean_positive_reward"],
         }
         self.all_metrics.update(reward_metrics)
         logger.info(
-            f"reward/avg_pass_at_{n_samples_per_prompt}: {overall_metrics['pass_at_n']}, reward/avg_raw_reward: {overall_metrics['avg_score']}, reward/mean_positive_reward: {overall_metrics['mean_positive_reward']}"
+            f"reward/avg_pass_at_{n_samples_per_prompt}: {overall_metrics['pass_at_n']}, "
+            f"reward/avg_raw_reward: {avg_raw_reward}, "
+            f"reward/best_avg_raw_reward_so_far: {self.best_raw_reward_so_far}, "
+            f"reward/mean_positive_reward: {overall_metrics['mean_positive_reward']}"
         )
         # re-assign reward but now it's per token rewards
         generator_output["rewards"] = per_token_rewards
@@ -1103,6 +1300,8 @@ class RayPPOTrainer:
             avg_rewards: float = return_sums[is_last_step[: num_samples - pad_size]].mean().item()
         else:
             avg_rewards: float = return_sums.mean().item()
+        if self.best_final_reward_so_far is None or avg_rewards > self.best_final_reward_so_far:
+            self.best_final_reward_so_far = avg_rewards
 
         avg_response_length = data.metadata["avg_response_length"]
         data = data.to("cpu")
@@ -1118,16 +1317,22 @@ class RayPPOTrainer:
         data.metadata["metrics"].update(
             {
                 "avg_final_rewards": avg_rewards,
+                "best_final_reward_so_far": self.best_final_reward_so_far,
                 "avg_response_length": avg_response_length,
                 "avg_advantages": avg_advantages,
                 "avg_advantages_abs": avg_advantages_abs,
             }
         )
 
-        logger.info(f"avg_final_rewards: {avg_rewards}, avg_response_length: {avg_response_length}")
+        logger.info(
+            f"avg_final_rewards: {avg_rewards}, "
+            f"best_final_reward_so_far: {self.best_final_reward_so_far}, "
+            f"avg_response_length: {avg_response_length}"
+        )
         self.all_metrics.update(
             {
                 "loss/avg_final_rewards": avg_rewards,
+                "loss/best_final_reward_so_far": self.best_final_reward_so_far,
                 "loss/avg_raw_advantages": avg_advantages,
                 "loss/avg_raw_advantages_abs": avg_advantages_abs,
             }
